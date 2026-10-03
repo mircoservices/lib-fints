@@ -4,7 +4,7 @@ import type { BankTransaction } from '../bankTransaction.js';
 import { FinTSConfig } from '../config.js';
 import { Dialog } from '../dialog.js';
 import { StatementInteractionCAMT } from '../interactions/statementInteractionCAMT.js';
-import { CustomerOrderMessage, Message } from '../message.js';
+import { CustomerMessage, CustomerOrderMessage, Message } from '../message.js';
 import { HICAZ, type HICAZSegment } from '../segments/HICAZ.js';
 import { HKCAZ, type HKCAZSegment } from '../segments/HKCAZ.js';
 import { registerSegments } from '../segments/registry.js';
@@ -103,6 +103,52 @@ describe('parted responses (bank answer code 3040)', () => {
 			'<Doc>one</Doc>',
 			'<Doc>two</Doc>',
 			'<Doc>three</Doc>',
+		]);
+	});
+
+	it('follows the continuation when the data arrives in the answer to a TAN message', async () => {
+		// After strong authentication the statements come back in the answer to the TAN
+		// message: complete HICAZ segments, no PARTED placeholder, plus code 3040. Before
+		// the fix the continuation was ignored and everything after the first portion lost.
+		config.bankingInformation.upd = {
+			version: 1,
+			usage: 0,
+			bankAccounts: [
+				{
+					accountNumber: '123',
+					iban: 'DE991234567123456',
+					bic: 'BANK12',
+					bank: { country: 280, bankId: '12030000' },
+					customerId: 'user',
+					accountType: 'CheckingAccount',
+					currency: 'EUR',
+					holder1: 'Holder',
+					allowedTransactions: [{ transId: 'HKCAZ' }],
+				},
+			],
+		} as unknown as BankingInformation['upd'];
+		const interaction = new StatementInteractionCAMT('123');
+		dialog.addCustomerInteraction(interaction);
+		// biome-ignore lint/suspicious/noExplicitAny: positioning the dialog on the order
+		(dialog as any).currentInteractionIndex = 1;
+
+		const answerToTan = Message.decode(
+			`HIRMG:3:2+0010::Entgegengenommen.+3040::Es liegen weitere Umsaetze vor.:AUFSETZ_1'${hicazText('<Doc>one</Doc>')}`,
+		);
+		const followUp = responseMessage(hicazText('<Doc>two</Doc>'), false);
+		vi.mocked(dialog.httpClient.sendMessage).mockResolvedValueOnce(followUp);
+
+		const tanMessage = new CustomerMessage('DIALOG', 2);
+		// biome-ignore lint/suspicious/noExplicitAny: reaching into the private collector on purpose
+		await (dialog as any).handlePartedMessages(tanMessage, answerToTan, interaction);
+
+		const sent = vi.mocked(dialog.httpClient.sendMessage).mock.calls[0][0] as CustomerOrderMessage;
+		expect(sent).toBeInstanceOf(CustomerOrderMessage);
+		expect(sent.findSegment<HKCAZSegment>(HKCAZ.Id)?.continuationMark).toBe('AUFSETZ_1');
+		const segments = answerToTan.findAllSegments<HICAZSegment>(HICAZ.Id);
+		expect(segments.flatMap((s) => s.bookedTransactions)).toEqual([
+			'<Doc>one</Doc>',
+			'<Doc>two</Doc>',
 		]);
 	});
 

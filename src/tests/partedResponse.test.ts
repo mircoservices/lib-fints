@@ -152,6 +152,29 @@ describe('parted responses (bank answer code 3040)', () => {
 		]);
 	});
 
+	it('fails loudly when a follow-up delivers no data', async () => {
+		const first = responseMessage(hicazText('<Doc>one</Doc>'), true);
+		const refused = Message.decode(
+			"HIRMG:3:2+3060::Bitte beachten Sie die Hinweise.'HIRMS:4:2:3+3955::Auftrag empfangen - Bitte Auftrag in Ihrer App freigeben.'",
+			HICAZ.Id,
+		);
+		vi.mocked(dialog.httpClient.sendMessage).mockResolvedValueOnce(refused);
+
+		const interaction = new StatementInteractionCAMT('123');
+		const request = new CustomerOrderMessage(HKCAZ.Id, HICAZ.Id);
+		request.addSegment({
+			header: { segId: HKCAZ.Id, segNr: 0, version: 1 },
+			account: { iban: 'DE991234567123456', bic: 'BANK12' },
+			acceptedCamtFormats: ['urn:iso:std:iso:20022:tech:xsd:camt.052.001.08'],
+			allAccounts: false,
+		} as HKCAZSegment);
+
+		await expect(
+			// biome-ignore lint/suspicious/noExplicitAny: reaching into the private collector on purpose
+			(dialog as any).handlePartedMessages(request, first, interaction),
+		).rejects.toThrow('did not deliver the remaining portions');
+	});
+
 	it('leaves an unparted response untouched', async () => {
 		const only = responseMessage(hicazText('<Doc>one</Doc>'), false);
 

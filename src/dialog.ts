@@ -344,6 +344,20 @@ export class Dialog {
 				hnhbkSegment.msgNr = ++this.lastMessageNumber;
 			}
 			const nextResponseMessage = await this.httpClient.sendMessage(request);
+			// A follow-up that carries no data must not end the loop quietly: the caller
+			// would take a truncated history for a complete one.
+			if (
+				nextResponseMessage.hasReturnCode(3955) ||
+				nextResponseMessage.getHighestReturnCode() >= 9000
+			) {
+				const detail = nextResponseMessage
+					.getBankAnswers()
+					.map((a) => `${a.code} ${a.text}`)
+					.join('; ');
+				throw new Error(
+					`The bank did not deliver the remaining portions of a parted response: ${detail}`,
+				);
+			}
 			rawPortions.push(
 				...nextResponseMessage
 					.findAllSegments<PartedSegment>(PARTED.Id)

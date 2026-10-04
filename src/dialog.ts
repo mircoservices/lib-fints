@@ -277,6 +277,12 @@ export class Dialog {
 	 * response message the caller holds. Combining their payloads needs to know what the
 	 * payload means — one MT940 stream continues, a list of CAMT documents is appended —
 	 * so that step belongs to the interaction, which does it via `findAllSegments`.
+	 *
+	 * The first portion is not always PARTED: when the order needed strong customer
+	 * authentication, its data arrives in the answer to the TAN message, which is decoded
+	 * as complete segments. The continuation is followed all the same, and because the TAN
+	 * message carries no order segment to attach the mark to, the follow-up is built from
+	 * the current interaction instead.
 	 */
 	private async handlePartedMessages(
 		message: CustomerMessage,
@@ -288,7 +294,7 @@ export class Dialog {
 		// PARTED, where `findAllSegments` cannot see them — lost without a trace.
 		const partedSegments = responseMessage.findAllSegments<PartedSegment>(PARTED.Id);
 
-		if (partedSegments.length === 0) {
+		if (partedSegments.length === 0 && !responseMessage.hasReturnCode(3040)) {
 			return;
 		}
 
@@ -297,12 +303,24 @@ export class Dialog {
 		const callersMessage = responseMessage;
 		const rawPortions = partedSegments.map((segment) => segment.rawData);
 
+		// The request the continuation mark goes into: the original order message, or a
+		// fresh one for the current interaction when the caller sent a TAN message.
+		const findOrderSegment = (m: CustomerMessage) =>
+			m.segments.find((s) => s.header.segId === interaction.segId) as
+				| SegmentWithContinuationMark
+				| undefined;
+		let request = message;
+		let orderSegment = findOrderSegment(request);
+		let freshRequest = false;
+		if (!orderSegment && responseMessage.hasReturnCode(3040)) {
+			request = this.createCurrentCustomerMessage();
+			orderSegment = findOrderSegment(request);
+			freshRequest = true;
+		}
+
 		while (responseMessage.hasReturnCode(3040)) {
 			const answers = responseMessage.getBankAnswers();
-			const segmentWithContinuation = message.segments.find(
-				(s) => s.header.segId === interaction.segId,
-			) as SegmentWithContinuationMark;
-			if (!segmentWithContinuation) {
+			if (!orderSegment) {
 				throw new Error(
 					`Response contains segment with further information, but corresponding segment could not be found or is not specified`,
 				);
@@ -314,13 +332,32 @@ export class Dialog {
 				throw new Error('Expected bank answer to contain continuation mark parameters (code 3040)');
 			}
 
-			segmentWithContinuation.continuationMark = answer.params[0];
-			const hnhbkSegment = message.findSegment<HNHBKSegment>(HNHBK.Id);
-			if (!hnhbkSegment) {
-				throw new Error('HNHBK segment not found in message');
+			orderSegment.continuationMark = answer.params[0];
+			// A freshly built request already carries the next message number.
+			if (freshRequest) {
+				freshRequest = false;
+			} else {
+				const hnhbkSegment = request.findSegment<HNHBKSegment>(HNHBK.Id);
+				if (!hnhbkSegment) {
+					throw new Error('HNHBK segment not found in message');
+				}
+				hnhbkSegment.msgNr = ++this.lastMessageNumber;
 			}
-			hnhbkSegment.msgNr = ++this.lastMessageNumber;
-			const nextResponseMessage = await this.httpClient.sendMessage(message);
+			const nextResponseMessage = await this.httpClient.sendMessage(request);
+			// A follow-up that carries no data must not end the loop quietly: the caller
+			// would take a truncated history for a complete one.
+			if (
+				nextResponseMessage.hasReturnCode(3955) ||
+				nextResponseMessage.getHighestReturnCode() >= 9000
+			) {
+				const detail = nextResponseMessage
+					.getBankAnswers()
+					.map((a) => `${a.code} ${a.text}`)
+					.join('; ');
+				throw new Error(
+					`The bank did not deliver the remaining portions of a parted response: ${detail}`,
+				);
+			}
 			rawPortions.push(
 				...nextResponseMessage
 					.findAllSegments<PartedSegment>(PARTED.Id)
@@ -331,8 +368,17 @@ export class Dialog {
 		}
 
 		// Every PARTED placeholder gives way to the decoded portions, at the position of
-		// the first one so the segment order stays intact.
-		const index = callersMessage.segments.indexOf(partedSegments[0]);
+		// the first one so the segment order stays intact. Without placeholders, the
+		// follow-up portions go right after the response segments already decoded.
+		let index = callersMessage.segments.indexOf(partedSegments[0]);
+		if (index === -1) {
+			const responseSegId =
+				interaction instanceof CustomerOrderInteraction ? interaction.responseSegId : undefined;
+			const lastResponse = callersMessage.segments.findLastIndex(
+				(segment) => segment.header.segId === responseSegId,
+			);
+			index = lastResponse === -1 ? callersMessage.segments.length : lastResponse + 1;
+		}
 		const withoutPlaceholders = callersMessage.segments.filter(
 			(segment) => segment.header.segId !== PARTED.Id,
 		);
